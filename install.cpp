@@ -668,7 +668,7 @@ int install_package(const std::string& path, bool* wipe_cache, const std::string
 
   int result;
   std::vector<std::string> log_buffer;
-  if (setup_install_mounts() != 0) {
+  if (setup_install_mounts(path) != 0) {
     LOG(ERROR) << "failed to set up expected mounts for install; aborting";
     result = INSTALL_ERROR;
   } else {

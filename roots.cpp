@@ -464,7 +464,21 @@ int format_volume(const char* volume) {
   return format_volume(volume, nullptr);
 }
 
-int setup_install_mounts() {
+// Returns true if 'path' is 'dir' itself or lives below it.
+static bool path_is_under(const std::string& path, const std::string& dir) {
+  if (dir.empty() || path.size() < dir.size()) {
+    return false;
+  }
+  if (path.compare(0, dir.size(), dir) != 0) {
+    return false;
+  }
+  if (path.size() == dir.size()) {
+    return true;
+  }
+  return dir == "/" || path[dir.size()] == '/';
+}
+
+int setup_install_mounts(const std::string& keep_mounted_path) {
   if (fstab == nullptr) {
     LOG(ERROR) << "can't set up install mounts: no fstab loaded";
     return -1;
@@ -483,6 +497,13 @@ int setup_install_mounts() {
         return -1;
       }
     } else {
+      // v521: leave the volume that holds the package we are about to install
+      // mounted.  Unmounting it would pull the package out from under the
+      // installer before it can be read.
+      if (path_is_under(keep_mounted_path, v->mount_point)) {
+        LOG(INFO) << "Keeping " << v->mount_point << " mounted for " << keep_mounted_path;
+        continue;
+      }
       // datamedia and anything managed by vold must be unmounted
       // with the detach flag to ensure that FUSE works.
       bool detach = false;

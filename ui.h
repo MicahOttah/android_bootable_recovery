@@ -266,6 +266,9 @@ class RecoveryUI {
   int key_down_count;             // under event_queue_mutex
   bool enable_reboot;             // under event_queue_mutex
   int rel_sum;
+  // v521: key presses that start before this point in time (monotonic
+  // milliseconds) are ignored, see RecoveryUI::ProcessKey().
+  long long key_grace_deadline_ms_;
 
   int consecutive_power_keys;
   int last_key;

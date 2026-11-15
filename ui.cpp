@@ -50,6 +50,16 @@ static constexpr int UI_WAIT_KEY_TIMEOUT_SEC = 120;
 static constexpr const char* BRIGHTNESS_FILE = BACKLIGHT_PATH "/brightness";
 static constexpr const char* MAX_BRIGHTNESS_FILE = BACKLIGHT_PATH "/max_brightness";
 
+// v521: key presses that start within this many milliseconds after the
+// recovery UI came up are ignored.  See RecoveryUI::ProcessKey().
+static constexpr long long kKeyGracePeriodMs = 3000;
+
+static long long monotonic_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return static_cast<long long>(ts.tv_sec) * 1000 + ts.tv_nsec / 1000000;
+}
+
 RecoveryUI::RecoveryUI()
     : locale_(""),
       rtl_locale_(false),
@@ -64,6 +74,7 @@ RecoveryUI::RecoveryUI()
       key_long_press(false),
       key_down_count(0),
       enable_reboot(true),
+      key_grace_deadline_ms_(0),
       consecutive_power_keys(0),
       last_key(-1),
       has_power_key(false),
@@ -155,6 +166,21 @@ static void* InputThreadLoop(void*) {
 }
 
 bool RecoveryUI::InitScreensaver() {
+  // v521: the device can opt out of the screensaver.
+  //
+  // The screensaver dims the backlight after UI_WAIT_KEY_TIMEOUT_SEC (120 s)
+  // of inactivity and switches it off completely after another 120 s.  A
+  // completely black screen in the recovery looks like a dead device, and the
+  // natural reaction to it is to hold the power button - which is exactly
+  // what used to reboot the device out of the recovery.
+  //
+  // The property is set from
+  // device/lge/v521/recovery/root/init.recovery.qcom.rc.
+  if (android::base::GetBoolProperty("recovery.disable_screensaver", false)) {
+    LOG(INFO) << "Screensaver disabled by recovery.disable_screensaver";
+    return false;
+  }
+
   // Disabled.
   if (brightness_normal_ == 0 || brightness_dimmed_ > brightness_normal_) {
     return false;
@@ -191,6 +217,10 @@ bool RecoveryUI::InitScreensaver() {
 bool RecoveryUI::Init(const std::string& locale) {
   // Set up the locale info.
   SetLocale(locale);
+
+  // v521: start the grace period during which key presses are ignored, see
+  // RecoveryUI::ProcessKey().
+  key_grace_deadline_ms_ = monotonic_ms() + kKeyGracePeriodMs;
 
   ev_init(std::bind(&RecoveryUI::OnInputEvent, this, std::placeholders::_1, std::placeholders::_2),
           touch_screen_allowed_);
@@ -395,6 +425,28 @@ int RecoveryUI::OnInputEvent(int fd, uint32_t epevents) {
       }
     }
 
+    // v521: ignore the kernel's auto-repeat events.
+    //
+    // The kernel reports a key that stays pressed as EV_KEY with value 1
+    // followed by a stream of EV_KEY events with value 2 (see
+    // drivers/input/input.c: input_repeat_key()).  The recovery UI does not
+    // know anything about key repeats, so passing a repeat on to
+    // ProcessKey() makes every repeat look like a fresh key press.  That
+    // (a) restarts the long-press timer on every repeat, so a long press is
+    // never detected, and (b) leaves key_last_down set, so that the eventual
+    // *release* of the key is registered as a key press.
+    //
+    // (b) is fatal on this device: the recovery can only be started with the
+    // hardware key combination, i.e. the user has to HOLD the power button
+    // while the recovery starts.  The release of that button is delivered to
+    // the recovery as a key press, the recovery menu is up at that moment and
+    // KEY_POWER means "invoke the highlighted item" - which is "Reboot".  The
+    // device used to reboot out of the recovery on its own a few seconds
+    // after the recovery came up.
+    if (ev.value == 2) {
+      return 0;
+    }
+
     ProcessKey(ev.code, ev.value);
   }
 
@@ -421,6 +473,25 @@ void RecoveryUI::ProcessKey(int key_code, int updown) {
   pthread_mutex_lock(&event_queue_mutex);
   key_pressed[key_code] = updown;
   if (updown) {
+    // v521: ignore a key press that starts within the first seconds after the
+    // recovery UI came up.
+    //
+    // The recovery is started with the hardware key combination, so the user
+    // is physically holding the power button while the recovery boots.  The
+    // kernel does not replay the key state when the recovery opens the input
+    // device, but it does keep sending auto-repeat events for the key that is
+    // still held (those are dropped in OnInputEvent()).  Should a driver
+    // nevertheless deliver a real key-down event for a button that was
+    // already held, the matching release would be registered as a key press
+    // and would select the highlighted recovery menu item ("Reboot").
+    //
+    // Dropping the key-down event also means that the matching release is
+    // dropped: a release is only registered when the matching key-down was
+    // seen (key_last_down).
+    if (monotonic_ms() < key_grace_deadline_ms_) {
+      pthread_mutex_unlock(&event_queue_mutex);
+      return;
+    }
     ++key_down_count;
     key_last_down = key_code;
     key_long_press = false;

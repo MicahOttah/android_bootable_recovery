@@ -17,6 +17,8 @@
 #ifndef RECOVERY_ROOTS_H_
 #define RECOVERY_ROOTS_H_
 
+#include <string>
+
 //#include <fs_mgr.h>
 
 typedef struct fstab_rec Volume;
@@ -53,7 +55,10 @@ int format_volume(const char* volume, const char* directory);
 
 // Ensure that all and only the volumes that packages expect to find
 // mounted (/tmp and /cache) are mounted.  Returns 0 on success.
-int setup_install_mounts();
+//
+// keep_mounted_path is the package that is about to be installed; the volume
+// that holds it is left mounted so that the file can still be read.
+int setup_install_mounts(const std::string& keep_mounted_path);
 
 int get_num_volumes();
 

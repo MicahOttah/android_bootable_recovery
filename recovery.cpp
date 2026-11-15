@@ -99,6 +99,9 @@ static const struct option OPTIONS[] = {
   { "wipe_ab", no_argument, NULL, 0 },
   { "wipe_package_size", required_argument, NULL, 0 },
   { "prompt_and_wipe_data", no_argument, NULL, 0 },
+  // v521: a "--wipe_data" that came from the bootloader instead of from the
+  // framework.  It is only carried out after the user confirmed it.
+  { "confirm_wipe_data", no_argument, NULL, 0 },
   { NULL, 0, NULL, 0 },
 };
 
@@ -355,6 +358,56 @@ static void redirect_stdio(const char* filename) {
     }
 }
 
+// v521: LG's aboot injects "recovery\n--wipe_data" into the bootloader
+// control block (BCB) every time the recovery is started from the hardware
+// key combination.  AOSP's recovery honours that verbatim, so every
+// key-combo boot silently erases /data.
+//
+// The framework (Settings -> "Erase all data", or an OTA factory reset)
+// writes its own request into the same field and it always looks like
+//   "recovery\n--wipe_data\n--reason=<...>\n--locale=<...>"
+// The bootloader does not touch the BCB on that path, so the extra
+// "--reason="/"--locale=" options are still there and the two cases can be
+// told apart.
+//
+// A wipe carrying one of those options was asked for by the user in Android
+// and is honoured as-is.  A wipe without them came from the bootloader and is
+// downgraded to "--confirm_wipe_data", i.e. the recovery asks before it
+// erases anything.
+static bool wipe_was_requested_by_user(const std::vector<std::string>& args) {
+  for (const auto& arg : args) {
+    if (android::base::StartsWith(arg, "--reason=") ||
+        android::base::StartsWith(arg, "--locale=")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// v521: replace a bootloader-injected "--wipe_data" with "--confirm_wipe_data"
+// unless the request came from the framework.
+static void gate_bootloader_wipe_data(std::vector<std::string>* args) {
+  bool has_wipe_data = false;
+  for (const auto& arg : *args) {
+    if (arg == "--wipe_data") {
+      has_wipe_data = true;
+      break;
+    }
+  }
+  if (!has_wipe_data || wipe_was_requested_by_user(*args)) {
+    return;
+  }
+
+  LOG(WARNING) << "Ignoring the bootloader's \"--wipe_data\" request: it was not "
+                  "issued by Android (Settings -> Erase all data).  The user is "
+                  "asked to confirm before /data is erased.";
+  for (auto& arg : *args) {
+    if (arg == "--wipe_data") {
+      arg = "--confirm_wipe_data";
+    }
+  }
+}
+
 // command line args come from, in decreasing precedence:
 //   - the actual command line
 //   - the bootloader control block (one per line, after "recovery")
@@ -414,6 +467,10 @@ static std::vector<std::string> get_args(const int argc, char** const argv) {
       LOG(INFO) << "Got " << args.size() << " arguments from " << COMMAND_FILE;
     }
   }
+
+  // v521: a "--wipe_data" that the bootloader put into the BCB on its own is
+  // not carried out silently, see gate_bootloader_wipe_data().
+  gate_bootloader_wipe_data(&args);
 
   // Write the arguments (excluding the filename in args[0]) back into the
   // bootloader control block. So the device will always boot into recovery to
@@ -830,8 +887,16 @@ static bool yes_no(Device* device, const char* question1, const char* question2)
       MenuItem(" Yes"),
     };
 
-    int chosen_item = get_menu_selection(false, MT_LIST, headers, items,
-                                         true, 0, device);
+    int chosen_item;
+    do {
+      chosen_item = get_menu_selection(false, MT_LIST, headers, items,
+                                       true, 0, device);
+      // v521: a volume change (vold reports one as soon as it mounts or
+      // unmounts something) makes the menu return Device::kRefresh.  That is
+      // not an answer to the question, so ask again instead of falling back
+      // to the default answer.
+    } while (chosen_item == Device::kRefresh);
+
     return (chosen_item == 1);
 }
 
@@ -879,6 +944,10 @@ static bool prompt_and_wipe_data(Device* device) {
   for (;;) {
     int chosen_item = get_menu_selection(false, MT_LIST, headers, items,
                                          true, 0, device);
+    // v521: a volume change is not an answer, keep the question on screen.
+    if (chosen_item == Device::kRefresh) {
+      continue;
+    }
     if (chosen_item != 1) {
       return true;  // Just reboot, no wipe; not a failure, user asked for it
     }
@@ -1168,21 +1237,31 @@ static int apply_from_storage(Device* device, const std::string& id, bool* wipe_
 
     ui->Print("\n-- Install %s ...\n", path.c_str());
     set_sdcard_update_bootloader_message();
-    void* token = start_sdcard_fuse(path.c_str());
 
-    vdc->volumeUnmount(vi.mId, true);
-
-    status = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
-                                 TEMPORARY_INSTALL_FILE, false, 0/*retry_count*/,
-                                 true/*verify*/);
+    // v521: install the package straight from where it lives.
+    //
+    // AOSP 8.1 always routes packages that sit on internal/external storage
+    // through the FUSE sideload provider: start_sdcard_fuse() forks a server
+    // that publishes the file as /sideload/package.zip, the source volume is
+    // then unmounted and the installer reads the package back through that
+    // FUSE mount.  On the V521 the FUSE server does not survive the unmount
+    // of the source volume, so /sideload is left behind as a dangling mount
+    // and the install dies with
+    //   "Unable to open '/sideload/package.zip': Transport endpoint is not
+    //    connected"
+    // Reading the file directly avoids the whole FUSE dance (and keeps the
+    // source volume mounted while the package is installed).
+    status = install_package(path.c_str(), wipe_cache,
+                                 TEMPORARY_INSTALL_FILE, true/*needs_mount*/,
+                                 0/*retry_count*/, true/*verify*/);
     if (status == INSTALL_UNVERIFIED &&
       ask_to_continue_unverified_install(device)) {
-        status = install_package(FUSE_SIDELOAD_HOST_PATHNAME, wipe_cache,
-                                 TEMPORARY_INSTALL_FILE, false, 0/*retry_count*/,
-                                 false/*verify*/);
+        status = install_package(path.c_str(), wipe_cache,
+                                 TEMPORARY_INSTALL_FILE, true/*needs_mount*/,
+                                 0/*retry_count*/, false/*verify*/);
     }
 
-    finish_sdcard_fuse(token);
+    vdc->volumeUnmount(vi.mId);
     return status;
 }
 
@@ -1539,7 +1618,12 @@ static void copy_userdata_files() {
                 file_copy(time_off_2_data, time_off_root);
             }
         }
-        ensure_path_unmounted("/data");
+        // v521: leave /data mounted.  AOSP unmounts it again right here, which
+        // leaves the recovery with no /data at all: nothing can be browsed
+        // under /data, packages that live on /data are unreadable and the
+        // user is told that /data could not be mounted.  The volume is
+        // unmounted again by format_volume() before it is wiped, so keeping
+        // it mounted here is safe.
     }
 }
 
@@ -1654,6 +1738,7 @@ int main(int argc, char **argv) {
     const char *update_package = NULL;
     bool should_wipe_data = false;
     bool should_prompt_and_wipe_data = false;
+    bool should_confirm_wipe_data = false;
     bool should_wipe_cache = false;
     bool should_wipe_ab = false;
     size_t wipe_package_size = 0;
@@ -1690,6 +1775,8 @@ int main(int argc, char **argv) {
                 android::base::ParseUint(optarg, &wipe_package_size);
             } else if (option == "prompt_and_wipe_data") {
                 should_prompt_and_wipe_data = true;
+            } else if (option == "confirm_wipe_data") {
+                should_confirm_wipe_data = true;
             }
             break;
         }
@@ -1813,6 +1900,35 @@ int main(int argc, char **argv) {
     } else if (should_wipe_data) {
         if (!wipe_data(device)) {
             status = INSTALL_ERROR;
+        }
+    } else if (should_confirm_wipe_data) {
+        // v521: the bootloader asked for a data wipe (it injects
+        // "--wipe_data" into the BCB when the recovery is started from the
+        // hardware key combination).  Ask the user before erasing anything;
+        // answering "No" simply continues into the recovery with the data
+        // intact.
+        ui->ShowText(true);
+        ui->SetBackground(RecoveryUI::ERROR);
+        if (ask_to_wipe_data(device)) {
+            if (!wipe_data(device)) {
+                status = INSTALL_ERROR;
+            }
+            ui->ShowText(false);
+        } else {
+            ui->Print("Keeping the user data.\n");
+            // v521: the user declined the wipe, so CONTINUE in the recovery.
+            //
+            // 'status' is INSTALL_SUCCESS at this point, and at the end of
+            // main() the recovery only shows the menu when
+            //
+            //     (status == INSTALL_NONE && !sideload_auto_reboot) ||
+            //     ui->IsTextVisible()
+            //
+            // is true.  With INSTALL_SUCCESS and the text hidden the
+            // recovery skips the menu and reboots right away, i.e. the
+            // device restarted itself as soon as the question was answered.
+            // INSTALL_NONE keeps the recovery in the main menu.
+            status = INSTALL_NONE;
         }
     } else if (should_prompt_and_wipe_data) {
         ui->ShowText(true);
