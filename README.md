@@ -10,7 +10,7 @@ This is the fork of the AOSP recovery that the **LG G Pad X 8.0 (V521)**
 What is different on lineage-15.1-v521
 --------------------------------------
 
-  9ab3795a8  v521: do not wipe /data silently and do not reboot out of the
+  08bbbb07e  v521: do not wipe /data silently and do not reboot out of the
              recovery
 
 LG's aboot passes `--wipe_data` to the recovery when the device is
