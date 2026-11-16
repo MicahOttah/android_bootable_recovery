@@ -1,29 +1,12 @@
 LG G Pad X 8.0 (V521) - LineageOS 15.1
 =====================================
 
-This is the fork of the AOSP recovery that the **LG G Pad X 8.0 (V521)**
-**LineageOS 15.1** port uses.
+Fork of the LineageOS recovery for the V521 port (branch
+`lineage-15.1-v521`).  Change: LG's aboot passes `--wipe_data` when the
+device is flashed; this recovery asks before wiping and does not reboot out
+of itself.
 
-  Branch              lineage-15.1-v521
-  Device tree         https://github.com/MicahOttah/android_device_lge_v521
-
-What is different on lineage-15.1-v521
---------------------------------------
-
-  08bbbb07e  v521: do not wipe /data silently and do not reboot out of the
-             recovery
-
-LG's aboot passes `--wipe_data` to the recovery when the device is
-flashed.  The stock recovery honours it and wipes the user data without
-asking, which is not acceptable on a device that already runs a working
-ROM.  The wipe is therefore turned into a question, and the recovery does
-not reboot out of itself any more (it waits, so that the answer can be
-given on the device).
-
-Note that this is the **stock LineageOS recovery**.  The recovery partition
-of this device normally holds **TWRP**, and the ROM build never overwrites
-it: the `flash_recovery` trigger in `system/core`'s `init.rc` is commented
-out on purpose.
+Port and device tree: https://github.com/MicahOttah/android_device_lge_v521
 
 
 The Recovery Image
